@@ -1,4 +1,4 @@
-// Advanced YouTube RSS to JSON & XML Cloudflare Worker
+// Ultimate Universal YouTube RSS & Handle Resolver Cloudflare Worker
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -13,28 +13,44 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    let channelId = url.searchParams.get("channel_id");
-    if (!channelId) {
-      return new Response(JSON.stringify({ error: "Please provide channel_id" }), { 
+    let query = url.searchParams.get("channel_id") || url.searchParams.get("handle");
+    if (!query) {
+      return new Response(JSON.stringify({ error: "Please provide channel_id or handle" }), { 
         status: 400, 
         headers: { ...corsHeaders, "Content-Type": "application/json" } 
       });
     }
 
-    const ytRssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+    let channelId = query.trim();
 
     try {
+      // यदि यूजर ने '@' वाला हैंडल दिया है (जैसे @dlsnews या @abhisar_sharma), तो उसका असली UC... वाला ID ढूंढें
+      if (channelId.startsWith('@') || !channelId.startsWith('UC')) {
+        let handleClean = channelId.startsWith('@') ? channelId : '@' + channelId;
+        const ytPageRes = await fetch(`https://www.youtube.com/${handleClean}`, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+          }
+        });
+        const htmlText = await ytPageRes.text();
+        const match = htmlText.match(/"channelId":"(UC[\w-]+)"/) || htmlText.match(/"browseId":"(UC[\w-]+)"/);
+        if (match && match[1]) {
+          channelId = match[1];
+        }
+      }
+
+      // असली YouTube RSS URL
+      const ytRssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+
       const response = await fetch(ytRssUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-          "Accept-Language": "hi-IN,hi;q=0.9,en-US;q=0.8,en;q=0.7",
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Cache-Control": "no-cache"
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
       });
       
       if (!response.ok) {
-        return new Response(JSON.stringify({ error: `YouTube Blocked: ${response.status}` }), { 
+        return new Response(JSON.stringify({ error: `YouTube RSS Failed: ${response.status} for ID: ${channelId}` }), { 
           status: 500, 
           headers: { ...corsHeaders, "Content-Type": "application/json" } 
         });
@@ -42,7 +58,6 @@ export default {
 
       const xmlText = await response.text();
 
-      // सीधा XML पास करके क्लाइंट को सुरक्षित रूप से भेजना
       return new Response(xmlText, {
         status: 200,
         headers: {
