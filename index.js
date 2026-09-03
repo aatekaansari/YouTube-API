@@ -1,6 +1,7 @@
-// index.js — YouTube Worker v5 (पुराना working structure + /videos scraping)
-// ✅ RSS जब चले | ✅ YouTube /videos page scrape (सबसे reliable) | ✅ Invidious/Piped last में
+// index.js — YouTube Worker v6 (v5 structure + ✅ videoId mode + ✅ InnerTube fallbacks)
+// ✅ RSS जब चले | ✅ /videos scraping | ✅ InnerTube browse/player | ✅ Invidious/Piped last
 // ✅ Success-only cache | ✅ Detailed errors | ✅ CORS
+// NEW: ?videoId=XXXX  -> {status, tags, desc, transcript(पूरा स्क्रिप्ट)}
 
 export default {
   async fetch(request) {
@@ -14,6 +15,7 @@ export default {
 
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
     const YT_COOKIES = "CONSENT=YES+cb.20240101-00-p0.en+FX+100; SOCS=CAI";
+    const FALLBACK_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"; // YouTube WEB public UI key
 
     const withTimeout = (ms) => {
       const c = new AbortController();
@@ -22,12 +24,13 @@ export default {
     };
     const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
-    // ✅ Verified IDs (resolution fail होने पर)
     const KNOWN_CHANNELS = {
       "@aajtak": "UCt4t-jeY85JegMlZ-E5UWtA",
       "@abpnews": "UCRWFSbif-RFENbBrSiez1DA",
       "@zeenews": "UCIvaYmXn910QMdemBG3v1pQ",
       "@news18india": "UCPP3etACgdUWvizcES1dJ8Q",
+      "@dlsnews": "UCw0ry7cLRUnq3Oaszlhgqfg",
+      "@indiatvnews": "UCC9BmFerE1xxhZu5VmYhMkA",
     };
 
     const INVIDIOUS = [
@@ -52,7 +55,6 @@ export default {
       } catch (e) { return null; }
     }
 
-    // "3 hours ago" → ISO date
     function relToIso(text) {
       const m = String(text || "").match(/(\d+)\s*(second|minute|hour|day|week|month|year)/i);
       if (!m) return new Date().toISOString();
@@ -61,7 +63,6 @@ export default {
       return new Date(Date.now() - n * map[m[2].toLowerCase()]).toISOString();
     }
 
-    // ✅ Client ke parseFeedEntries ke liye Atom XML (same format jo YouTube RSS देता है)
     function buildAtomXml(items, channelTitle) {
       const entries = items.map(v => `  <entry>
     <id>yt:video:${esc(v.id)}</id>
@@ -109,7 +110,6 @@ ${entries}
       return candidates;
     }
 
-    /* ✅✅✅ नया सबसे reliable source: YouTube /videos page se seedha videos */
     async function scrapeChannelVideos(q) {
       const h = q.startsWith("@") ? q : "@" + q;
       const paths = q.startsWith("UC")
@@ -160,6 +160,161 @@ ${entries}
       return { items: [], channelTitle: q };
     }
 
+    /* ================= ✅ v6 NEW: InnerTube helpers ================= */
+    async function innertubePost(endpoint, apiKey, extra) {
+      try {
+        const to = withTimeout(9000);
+        const r = await fetch(`https://www.youtube.com/youtubei/v1/${endpoint}?key=${apiKey}&prettyPrint=false`, {
+          method: "POST", signal: to.signal,
+          headers: { "Content-Type": "application/json", "User-Agent": UA },
+          body: JSON.stringify({ context: { client: { clientName: "WEB", clientVersion: "2.20260901.00.00", hl: "hi", gl: "IN" } }, ...extra })
+        });
+        to.done();
+        if (!r.ok) return null;
+        return await r.json();
+      } catch (e) { return null; }
+    }
+
+    async function innertubePlayer(apiKey, videoId, android) {
+      const client = android
+        ? { clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 30, hl: "hi" }
+        : { clientName: "WEB", clientVersion: "2.20260901.00.00", hl: "hi", gl: "IN" };
+      try {
+        const to = withTimeout(9000);
+        const r = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}&prettyPrint=false`, {
+          method: "POST", signal: to.signal,
+          headers: { "Content-Type": "application/json", "User-Agent": UA },
+          body: JSON.stringify({ context: { client }, videoId })
+        });
+        to.done();
+        if (!r.ok) return null;
+        return await r.json();
+      } catch (e) { return null; }
+    }
+
+    function collectVideos(node, out, seen, depth) {
+      if (!node || typeof node !== "object" || out.length >= 15 || depth > 40) return;
+      if (Array.isArray(node)) { for (const x of node) collectVideos(x, out, seen, depth + 1); return; }
+      const vr = node.videoRenderer;
+      if (vr && vr.videoId && !seen[vr.videoId]) {
+        seen[vr.videoId] = 1;
+        const thumbs = ((vr.thumbnail || {}).thumbnails) || [];
+        out.push({
+          id: vr.videoId,
+          title: (((vr.title || {}).runs) || [{}])[0].text || "",
+          published: relToIso((vr.publishedTimeText || {}).simpleText),
+          thumbnail: (thumbs.length ? thumbs[thumbs.length - 1].url : "") || `https://i.ytimg.com/vi/${vr.videoId}/hqdefault.jpg`,
+          channelTitle: (((vr.ownerText || {}).runs) || [{}])[0].text || ""
+        });
+      } else {
+        for (const k in node) collectVideos(node[k], out, seen, depth + 1);
+      }
+    }
+
+    function collectChannels(node, out, depth) {
+      if (!node || typeof node !== "object" || depth > 40) return;
+      if (Array.isArray(node)) { for (const x of node) collectChannels(x, out, depth + 1); return; }
+      if (node.channelRenderer && node.channelRenderer.channelId) {
+        out.push({
+          id: node.channelRenderer.channelId,
+          name: (node.channelRenderer.title && node.channelRenderer.title.simpleText) || "",
+          url: node.channelRenderer.canonicalBaseUrl || ""
+        });
+      }
+      for (const k in node) collectChannels(node[k], out, depth + 1);
+    }
+
+    // ✅ v6: channel videos via InnerTube browse (RSS/scrape fail होने पर)
+    async function innertubeChannelVideos(q, candidates) {
+      const clean = q.replace(/^@/, "").toLowerCase();
+      const apiKey = FALLBACK_KEY;
+      let ids = (candidates || []).slice(0, 2);
+      if (!ids.length) {
+        const s = await innertubePost("search", apiKey, { query: clean, params: "EgIQAg==" });
+        if (s) {
+          const list = []; collectChannels(s, list, 0);
+          const hit = list.find(c => (c.url || "").toLowerCase().includes("@" + clean)) || list[0];
+          if (hit) ids = [hit.id];
+        }
+      }
+      for (const id of ids) {
+        const b = await innertubePost("browse", apiKey, { browseId: id, params: "EgZ2aWRlb3M%3D" });
+        if (b) {
+          const items = []; collectVideos(b, items, {}, 0);
+          const cleanItems = items.filter(v => v.id && v.title);
+          if (cleanItems.length) return cleanItems;
+        }
+      }
+      return [];
+    }
+
+    async function transcriptFromTracks(tracks) {
+      const sub = tracks.find(t => t.languageCode === "hi") || tracks.find(t => t.languageCode === "en") || tracks[0];
+      if (!sub || !sub.baseUrl) return "";
+      try {
+        const to = withTimeout(9000);
+        const r = await fetch(sub.baseUrl, { signal: to.signal, headers: { "User-Agent": UA } });
+        to.done();
+        if (!r.ok) return "";
+        const xmlText = await r.text();
+        return xmlText.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim();
+      } catch (e) { return ""; }
+    }
+
+    /* ================= ✅ v6 NEW: VIDEO MODE (?videoId=) ================= */
+    async function handleVideoId(videoId) {
+      let tags = [], desc = "", transcript = "", tracks = [];
+      let apiKey = FALLBACK_KEY;
+
+      // 1) Watch page HTML
+      try {
+        const to = withTimeout(9000);
+        const r = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { signal: to.signal, headers: { "User-Agent": UA, "Accept-Language": "hi-IN,hi;q=0.9,en-US;q=0.8,en;q=0.7", "Cookie": YT_COOKIES } });
+        to.done();
+        if (r.ok) {
+          const html = await r.text();
+          const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/); if (km) apiKey = km[1];
+          const pm = html.match(/ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\});\s*<\/script>/);
+          if (pm) {
+            try {
+              const d = JSON.parse(pm[1]);
+              tags = (d.videoDetails && d.videoDetails.keywords) || [];
+              desc = (d.videoDetails && d.videoDetails.shortDescription) || "";
+              tracks = (((d.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || [];
+            } catch (e) { }
+          }
+          if (!tags.length) {
+            const k = html.match(/"keywords":\[(.*?)\]/s);
+            if (k) tags = [...k[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(m => m[1]);
+          }
+          if (!desc) { const d = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/s); if (d) desc = d[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'); }
+        }
+      } catch (e) { }
+
+      // 2) InnerTube WEB player
+      if (!desc || !tracks.length) {
+        const p = await innertubePlayer(apiKey, videoId, false);
+        if (p) {
+          tags = (p.videoDetails && p.videoDetails.keywords) || tags;
+          desc = (p.videoDetails && p.videoDetails.shortDescription) || desc;
+          tracks = (((p.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || tracks;
+        }
+      }
+      // 3) InnerTube ANDROID player (Hindi ASR captions reliable)
+      if (!tracks.length || !desc) {
+        const p2 = await innertubePlayer(apiKey, videoId, true);
+        if (p2) {
+          tags = (p2.videoDetails && p2.videoDetails.keywords) || tags;
+          desc = (p2.videoDetails && p2.videoDetails.shortDescription) || desc;
+          tracks = (((p2.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || tracks;
+        }
+      }
+
+      // 4) पूरा स्क्रिप्ट (captions XML se)
+      if (tracks.length) transcript = await transcriptFromTracks(tracks);
+      return json({ status: "ok", videoId, tags, desc, transcript });
+    }
+
     // Invidious/Piped (last resort)
     async function frontendChannelVideos(q) {
       for (const base of INVIDIOUS) {
@@ -203,9 +358,13 @@ ${entries}
     }
 
     try {
-      if (url.searchParams.get("ping")) return json({ ok: true, version: "v5", time: new Date().toISOString() });
+      if (url.searchParams.get("ping")) return json({ ok: true, version: "v6", time: new Date().toISOString() });
 
-      /* ============ TRENDING (पुराने worker जैसा ही) ============ */
+      /* ============ ✅ v6: VIDEO MODE routing ============ */
+      const videoId = (url.searchParams.get("videoId") || "").trim();
+      if (videoId) return handleVideoId(videoId);
+
+      /* ============ TRENDING (v5 जैसा ही) ============ */
       const trendingRegion = url.searchParams.get("trending");
       if (trendingRegion) {
         const cache = await caches.open("v5-tr");
@@ -238,9 +397,9 @@ ${entries}
         return json({ error: "All trending instances failed", region: trendingRegion }, 503);
       }
 
-      /* ============ CHANNEL MODE ============ */
+      /* ============ CHANNEL MODE (v5 + InnerTube) ============ */
       let query = (url.searchParams.get("channel_id") || url.searchParams.get("handle") || "").trim();
-      if (!query) return json({ error: "channel_id / handle भेजें, या ?trending=IN use करें", usage: "?channel_id=@aajtak या ?channel_id=UCxxxxx या ?trending=IN" }, 400);
+      if (!query) return json({ error: "channel_id / handle भेजें, या ?videoId= / ?trending=IN use करें", usage: "?channel_id=@aajtak | ?videoId=XXXX | ?trending=IN" }, 400);
 
       const cache = await caches.open("v5-rss");
       const cacheKey = new Request(`https://cache.local/ch-${query.toLowerCase()}`);
@@ -252,7 +411,7 @@ ${entries}
 
       const errors = [];
 
-      // 1) RSS (जब चले — पुराने worker जैसा)
+      // 1) RSS
       const candidates = query.startsWith("UC") ? [query] : await resolveHandle(query.startsWith("@") ? query : "@" + query);
       for (const cid of candidates) {
         const x = await fetchRss(cid);
@@ -263,7 +422,7 @@ ${entries}
         errors.push(`RSS 404 for ${cid}`);
       }
 
-      // 2) ✅ नया primary fallback: /videos page scraping
+      // 2) /videos page scraping
       const scraped = await scrapeChannelVideos(query);
       if (scraped.items.length) {
         const atom = buildAtomXml(scraped.items, scraped.channelTitle);
@@ -271,6 +430,15 @@ ${entries}
         return xml(atom, { "X-Source": "yt-scrape" });
       }
       errors.push("YouTube /videos scrape fail हुआ");
+
+      // 2.5) ✅ v6 NEW: InnerTube browse
+      const itItems = await innertubeChannelVideos(query, candidates);
+      if (itItems.length) {
+        const atom = buildAtomXml(itItems, itItems[0].channelTitle || query);
+        await cache.put(cacheKey, new Response(atom, { headers: { "Cache-Control": "max-age=600" } }));
+        return xml(atom, { "X-Source": "innertube-browse" });
+      }
+      errors.push("InnerTube browse भी fail हुआ");
 
       // 3) Invidious/Piped
       const fe = await frontendChannelVideos(query.startsWith("UC") ? query : (query.startsWith("@") ? query : "@" + query));
