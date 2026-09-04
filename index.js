@@ -1,4 +1,4 @@
-// index.js — YouTube Worker v7 (v6 + YouTubeToTranscript.com + Kome)
+// index.js — YouTube Worker v8 (v7 + Invidious Captions + Smart Cache + Transcript Endpoint)
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -86,8 +86,7 @@ export default {
 
     async function innertubePlayer(apiKey, videoId, android) {
       const client = android ? { clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 30, hl: "hi" } : { clientName: "WEB", clientVersion: "2.20260901.00.00", hl: "hi", gl: "IN" };
-      try { const to = withTimeout(9000); const r = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}&prettyPrint=false`, { method: "POST", signal: to.signal, headers: { "Content-Type": "application/json", "User-Agent": UA }, body: JSON.stringify({ context: { client }, videoId }) }); to.done(); if (!r.ok) return null; return await r.json(); } catch (e) { return null; }
-    }
+      try { const to = withTimeout(9000); const r = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}&prettyPrint=false`, { method: "POST", signal: to.signal, headers: { "Content-Type": "application/json", "User-Agent": UA }, body: JSON.stringify({ context: { client }, videoId }) }); to.done(); if (!r.ok) return null; return await r.json(); } catch (e) { return null; } }
 
     function collectVideos(node, out, seen, depth) {
       if (!node || typeof node !== "object" || out.length >= 15 || depth > 40) return;
@@ -122,13 +121,49 @@ export default {
       return [];
     }
 
+    // ===== ✅ v8 TRANSCRIPT LAYER 1: YouTube Caption Tracks (Hindi priority) =====
     async function transcriptFromTracks(tracks) {
-      const sub = tracks.find(t => t.languageCode === "hi") || tracks.find(t => t.languageCode === "en") || tracks[0];
-      if (!sub || !sub.baseUrl) return "";
-      try { const to = withTimeout(9000); const r = await fetch(sub.baseUrl, { signal: to.signal, headers: { "User-Agent": UA } }); to.done(); if (!r.ok) return ""; const x = await r.text(); return x.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim(); } catch (e) { return ""; }
+      const pick = tracks.find(t => t.languageCode === "hi") || tracks.find(t => t.languageCode === "en") || tracks.find(t => t.kind !== "asr") || tracks[0];
+      if (!pick || !pick.baseUrl) return { text: "", lang: "" };
+      try {
+        const to = withTimeout(9000);
+        const r = await fetch(pick.baseUrl, { signal: to.signal, headers: { "User-Agent": UA } });
+        to.done();
+        if (!r.ok) return { text: "", lang: "" };
+        const x = await r.text();
+        const text = x.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim();
+        return { text, lang: pick.languageCode || "" };
+      } catch (e) { return { text: "", lang: "" }; }
     }
 
-    // ✅ v7 NEW: YouTubeToTranscript.com server-side scrape (आपके स्क्रीनशॉट वाला सोर्स)
+    // ===== ✅ v8 TRANSCRIPT LAYER 2: Invidious Open-Source Captions (नया) =====
+    async function invidiousTranscript(videoId) {
+      for (const base of INVIDIOUS) {
+        for (const lang of ["hi", "en"]) {
+          try {
+            const d = await getJSON(`${base}/api/v1/captions/${videoId}?lang=${lang}`, 7000);
+            if (d && Array.isArray(d.subtitles)) {
+              const txt = d.subtitles.map(s => s.text || "").join(" ").replace(/\s+/g, " ").trim();
+              if (txt.length > 50) return { text: txt, lang };
+            }
+          } catch (e) { }
+        }
+        try {
+          const list = await getJSON(`${base}/api/v1/captions/${videoId}`, 6000);
+          if (Array.isArray(list) && list.length) {
+            const lang = (list.find(l => (l.languageCode || "").startsWith("hi")) || list[0]).languageCode;
+            const d = await getJSON(`${base}/api/v1/captions/${videoId}?lang=${lang}`, 7000);
+            if (d && Array.isArray(d.subtitles)) {
+              const txt = d.subtitles.map(s => s.text || "").join(" ").replace(/\s+/g, " ").trim();
+              if (txt.length > 50) return { text: txt, lang };
+            }
+          }
+        } catch (e) { }
+      }
+      return { text: "", lang: "" };
+    }
+
+    // ===== TRANSCRIPT LAYER 3: YouTubeToTranscript.com =====
     async function ytToTranscript(videoId) {
       try {
         const to = withTimeout(12000);
@@ -145,6 +180,7 @@ export default {
       } catch (e) { return ""; }
     }
 
+    // ===== TRANSCRIPT LAYER 4: Kome.ai =====
     async function komeTranscript(videoId) {
       try {
         const to = withTimeout(9000);
@@ -155,8 +191,18 @@ export default {
       return "";
     }
 
+    // ===== ✅ v8: VIDEO METADATA + TRANSCRIPT (Smart Cache के साथ) =====
     async function handleVideoId(videoId) {
-      let tags = [], desc = "", transcript = "", tracks = [];
+      // Cache check (10 मिनट) — quota बचाता है
+      const cache = await caches.open("v8-vid");
+      const cacheKey = new Request(`https://cache.local/vid-${videoId}`);
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        const t = await cached.text();
+        try { const d = JSON.parse(t); if (d && (d.desc || d.transcript || (d.tags && d.tags.length))) return new Response(t, { headers: { ...cors, "Content-Type": "application/json", "X-Cache": "HIT" } }); } catch (e) { }
+      }
+
+      let tags = [], desc = "", tracks = [];
       let apiKey = FALLBACK_KEY;
       try {
         const to = withTimeout(9000);
@@ -173,10 +219,17 @@ export default {
       } catch (e) { }
       if (!desc || !tracks.length) { const p = await innertubePlayer(apiKey, videoId, false); if (p) { tags = (p.videoDetails && p.videoDetails.keywords) || tags; desc = (p.videoDetails && p.videoDetails.shortDescription) || desc; tracks = (((p.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || tracks; } }
       if (!tracks.length || !desc) { const p2 = await innertubePlayer(apiKey, videoId, true); if (p2) { tags = (p2.videoDetails && p2.videoDetails.keywords) || tags; desc = (p2.videoDetails && p2.videoDetails.shortDescription) || desc; tracks = (((p2.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || tracks; } }
-      if (tracks.length) transcript = await transcriptFromTracks(tracks);
-      if (!transcript) transcript = await ytToTranscript(videoId);   // ✅ v7
-      if (!transcript) transcript = await komeTranscript(videoId);  // ✅ v7
-      return json({ status: "ok", videoId, tags, desc, transcript, hasCaptions: tracks.length > 0 });
+
+      // ✅ 4-Layer Transcript Extraction
+      let tr = { text: "", lang: "" };
+      if (tracks.length) tr = await transcriptFromTracks(tracks);
+      if (!tr.text) tr = await invidiousTranscript(videoId);
+      if (!tr.text) { const t = await ytToTranscript(videoId); if (t) tr = { text: t, lang: "auto" }; }
+      if (!tr.text) { const t = await komeTranscript(videoId); if (t) tr = { text: t, lang: "auto" }; }
+
+      const body = JSON.stringify({ status: "ok", videoId, tags, desc, transcript: tr.text, transcriptLang: tr.lang, hasCaptions: tracks.length > 0 });
+      await cache.put(cacheKey, new Response(body, { headers: { "Cache-Control": "max-age=600" } }));
+      return new Response(body, { headers: { ...cors, "Content-Type": "application/json" } });
     }
 
     async function frontendChannelVideos(q) {
@@ -201,8 +254,17 @@ export default {
     }
 
     try {
-      if (url.searchParams.get("ping")) return json({ ok: true, version: "v7", time: new Date().toISOString() });
-      const videoId = (url.searchParams.get("videoId") || "").trim();
+      if (url.searchParams.get("ping")) return json({ ok: true, version: "v8", time: new Date().toISOString() });
+
+      // ✅ नया: dedicated transcript endpoint — browser में direct test करें
+      const trOnly = (url.searchParams.get("transcript") || "").trim();
+      if (trOnly) {
+        const d = await handleVideoId(trOnly);
+        const j = await d.json();
+        return json({ status: "ok", videoId: trOnly, transcript: j.transcript || "", lang: j.transcriptLang || "", hasCaptions: j.hasCaptions || false });
+      }
+
+      const videoId = (url.searchParams.get("videoId") || url.searchParams.get("v") || "").trim();
       if (videoId) return handleVideoId(videoId);
 
       const trendingRegion = url.searchParams.get("trending");
@@ -223,7 +285,7 @@ export default {
       }
 
       let query = (url.searchParams.get("channel_id") || url.searchParams.get("handle") || "").trim();
-      if (!query) return json({ error: "channel_id / handle / videoId भेजें", usage: "?channel_id=@aajtak | ?videoId=XXXX | ?trending=IN" }, 400);
+      if (!query) return json({ error: "channel_id / handle / videoId / transcript भेजें", usage: "?channel_id=@aajtak | ?videoId=XXXX | ?transcript=XXXX | ?trending=IN" }, 400);
 
       const cache = await caches.open("v5-rss");
       const cacheKey = new Request(`https://cache.local/ch-${query.toLowerCase()}`);
